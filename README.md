@@ -23,7 +23,7 @@ install.packages(c("foreign", "tidyverse", "geepack", "geesmv", "broom", "string
 
 ## File Structure
 ```text
-Trial-Diagnostic-Analysis/
+Diagnostic_Accuracy_c-RCT_Analysis/
 ├── README.md
 └── Primary Analytic Code.Rmd
 ```
