@@ -1,0 +1,874 @@
+---
+title: "Diagnostic Accuracy Analysis for a Cluster-Randomized Trial"
+author: "Zada Tiimob"
+date: "2026-02-22"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ============================================
+# DIAGNOSTIC ACCURACY ANALYSIS
+# ============================================
+
+library(foreign)
+library(tidyverse)
+library(geepack)
+library(geesmv)
+library(broom)
+library(stringr)
+library(ggplot2)
+
+# ============================================
+# 1. DATA PREPARATION
+# ============================================
+
+# Load data 
+data <- read.dta("analysis_data.dta")
+
+# Prepare analysis dataset
+prepare_analysis_data <- function(data) {
+  data %>%
+    mutate(
+      # Convert cluster to factor
+      cluster = as.factor(cluster),
+
+      # Create analysis variables for each condition
+      # Condition 1
+      cond1_accurate = as.numeric(cond1_psdiag == cond1_hwdiag),
+      # Condition 2
+      cond2_accurate = as.numeric(cond2_psdiag == cond2_hwdiag),
+
+      # Intervention indicator
+      arm_num = as.numeric(arm == "Intervention"),
+
+      # Covariates
+      wave_numeric = as.numeric(factor(
+        wave,
+        levels = c("Wave 1", "Wave 2", "Wave 3")
+      )),
+      age_centered = as.numeric(age - mean(age, na.rm = TRUE)),
+      male = as.numeric(gender == "Male"),
+      cluster_id = as.factor(cluster)
+    ) %>%
+    # Filter to analysis sample (patients with complete data)
+    filter(
+      (!is.na(cond1_psdiag) & !is.na(cond1_hwdiag)) |
+        (!is.na(cond2_psdiag) & !is.na(cond2_hwdiag))
+    )
+}
+
+# Prepare data
+analysis_data <- prepare_analysis_data(data)
+
+# Function to create condition-specific dataset
+prepare_condition_data <- function(data, condition) {
+  psdiag <- paste0(condition, "_psdiag")
+  hwdiag <- paste0(condition, "_hwdiag")
+  accurate <- paste0(condition, "_accurate")
+
+  data %>%
+    filter(!is.na(!!sym(psdiag)), !is.na(!!sym(hwdiag))) %>%
+    mutate(
+      accurate = !!sym(accurate),
+      disease = !!sym(psdiag),
+      test = !!sym(hwdiag)
+    ) %>%
+    select(
+      accurate, disease, test, arm_num, cluster_id,
+      wave_numeric, age, age_centered, male
+    ) %>%
+    filter(
+      !is.na(wave_numeric),
+      !is.na(age),
+      !is.na(age_centered),
+      !is.na(male)
+    )
+}
+
+# Create condition-specific datasets
+cond1_data <- prepare_condition_data(analysis_data, "cond1")
+cond2_data <- prepare_condition_data(analysis_data, "cond2")
+
+# ============================================
+# 2. DESCRIPTIVE STATISTICS - TABLE 4
+# ============================================
+
+create_table4 <- function() {
+  bind_rows(
+    cond1_data %>% mutate(condition = "Condition 1"),
+    cond2_data %>% mutate(condition = "Condition 2")
+  ) %>%
+    group_by(condition, arm_num) %>%
+    summarise(
+      n_patients = n(),
+      n_clusters = n_distinct(cluster_id),
+      age_mean = mean(age, na.rm = TRUE),
+      age_sd = sd(age, na.rm = TRUE),
+      pct_male = mean(male, na.rm = TRUE) * 100,
+      .groups = "drop"
+    )
+}
+
+# Create Table 4
+table4 <- create_table4()
+
+# ============================================
+# 3. CLUSTER-LEVEL DIAGNOSTIC METRICS
+# ============================================
+
+calculate_cluster_metrics <- function(data, condition_name) {
+  data %>%
+    group_by(cluster_id, arm_num) %>%
+    summarise(
+      N = n(),
+      TP = sum(disease == 1 & test == 1, na.rm = TRUE),
+      TN = sum(disease == 0 & test == 0, na.rm = TRUE),
+      FP = sum(disease == 0 & test == 1, na.rm = TRUE),
+      FN = sum(disease == 1 & test == 0, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      condition = condition_name,
+      arm = ifelse(arm_num == 1, "Intervention", "Control"),
+
+      # Calculate metrics
+      sensitivity = ifelse(TP + FN > 0, TP / (TP + FN), NA_real_),
+      specificity = ifelse(TN + FP > 0, TN / (TN + FP), NA_real_),
+      ppv = ifelse(TP + FP > 0, TP / (TP + FP), NA_real_),
+      npv = ifelse(TN + FN > 0, TN / (TN + FN), NA_real_),
+      accuracy = (TP + TN) / N,
+
+      # Format for display
+      sensitivity_pct = sensitivity * 100,
+      specificity_pct = specificity * 100,
+      ppv_pct = ppv * 100,
+      npv_pct = npv * 100,
+      accuracy_pct = accuracy * 100,
+
+      cluster_label = paste("Cluster", cluster_id)
+    )
+}
+
+# Calculate cluster metrics
+cond1_cluster <- calculate_cluster_metrics(cond1_data, "Condition 1")
+cond2_cluster <- calculate_cluster_metrics(cond2_data, "Condition 2")
+
+# ============================================
+# 4. GEE ANALYSIS FUNCTION WITH KC CORRECTION
+# ============================================
+
+run_gee_kc <- function(formula, data, family = "binomial",
+                       link = "logit", corstr = "exchangeable") {
+  tryCatch({
+    # Fit GEE model
+    gee_fit <- geeglm(
+      formula,
+      family = binomial(link = link),
+      data = data,
+      id = cluster_id,
+      corstr = corstr
+    )
+
+    # Apply KC correction
+    kc_result <- GEE.var.kc(
+      formula = formula,
+      id = "cluster_id",
+      family = family,
+      data = data,
+      corstr = corstr
+    )
+
+    # Extract coefficients and corrected SEs
+    beta <- coef(gee_fit)
+    kc_cov <- as.matrix(kc_result$cov.beta)
+
+    # Check and align the covariance matrix with the model coefficients
+    if (nrow(kc_cov) != length(beta) ||
+        ncol(kc_cov) != length(beta)) {
+      stop("KC covariance matrix dimensions do not match model coefficients.")
+    }
+
+    if (!is.null(rownames(kc_cov)) &&
+        !is.null(colnames(kc_cov)) &&
+        all(names(beta) %in% rownames(kc_cov)) &&
+        all(names(beta) %in% colnames(kc_cov))) {
+      kc_cov <- kc_cov[names(beta), names(beta), drop = FALSE]
+    } else {
+      dimnames(kc_cov) <- list(names(beta), names(beta))
+    }
+
+    kc_se <- sqrt(pmax(diag(kc_cov), 0))
+
+    # Calculate degrees of freedom
+    n_clusters <- n_distinct(data$cluster_id)
+    n_params <- length(beta)
+    df <- max(1, n_clusters - n_params - 1)
+
+    # Calculate t-statistics and p-values
+    t_stats <- beta / kc_se
+    p_values <- 2 * pt(-abs(t_stats), df = df)
+
+    # Calculate confidence intervals using t-distribution
+    t_crit <- qt(0.975, df = df)
+    conf_low <- beta - t_crit * kc_se
+    conf_high <- beta + t_crit * kc_se
+
+    # Return results
+    results <- data.frame(
+      term = names(beta),
+      estimate = as.numeric(beta),
+      std.error = as.numeric(kc_se),
+      statistic = as.numeric(t_stats),
+      df = df,
+      p.value = as.numeric(p_values),
+      conf.low = as.numeric(conf_low),
+      conf.high = as.numeric(conf_high)
+    )
+
+    # Retain covariance matrix for valid linear contrasts downstream
+    attr(results, "kc_cov") <- kc_cov
+
+    results
+  }, error = function(e) {
+    message(paste("Model failed:", e$message))
+    return(NULL)
+  })
+}
+
+# Calculate an estimate and standard error for a linear contrast
+calculate_kc_contrast <- function(model, contrast_weights) {
+  if (is.null(model) || nrow(model) == 0) {
+    return(NULL)
+  }
+
+  kc_cov <- attr(model, "kc_cov")
+
+  if (is.null(kc_cov)) {
+    stop("KC covariance matrix was not retained for this model.")
+  }
+
+  beta <- setNames(model$estimate, model$term)
+
+  if (!all(names(contrast_weights) %in% names(beta))) {
+    stop("One or more contrast terms were not found in the fitted model.")
+  }
+
+  contrast_weights <- contrast_weights[names(contrast_weights)]
+  estimate <- sum(contrast_weights * beta[names(contrast_weights)])
+
+  contrast_cov <- kc_cov[
+    names(contrast_weights),
+    names(contrast_weights),
+    drop = FALSE
+  ]
+
+  variance <- as.numeric(
+    t(as.matrix(contrast_weights)) %*%
+      contrast_cov %*%
+      as.matrix(contrast_weights)
+  )
+
+  se <- sqrt(max(variance, 0))
+  df <- unique(model$df)
+  t_stat <- estimate / se
+  t_crit <- qt(0.975, df = df)
+
+  data.frame(
+    estimate = estimate,
+    se = se,
+    t_stat = t_stat,
+    p_value = 2 * pt(-abs(t_stat), df = df),
+    conf_low = estimate - t_crit * se,
+    conf_high = estimate + t_crit * se,
+    df = df
+  )
+}
+
+# ============================================
+# 5. OVERALL ACCURACY MODELS - TABLE 7
+# ============================================
+
+run_accuracy_models <- function(data, condition_name) {
+  models <- list()
+
+  for (corr in c("exchangeable", "independence")) {
+    # Unadjusted
+    unadj <- run_gee_kc(accurate ~ arm_num, data, corstr = corr)
+
+    if (!is.null(unadj)) {
+      unadj$model <- "unadjusted"
+      unadj$correlation <- corr
+      unadj$condition <- condition_name
+      models[[paste(condition_name, corr, "unadj")]] <- unadj
+    }
+
+    # Adjusted
+    adj <- run_gee_kc(
+      accurate ~ arm_num + wave_numeric + age_centered + male,
+      data,
+      corstr = corr
+    )
+
+    if (!is.null(adj)) {
+      adj$model <- "adjusted"
+      adj$correlation <- corr
+      adj$condition <- condition_name
+      models[[paste(condition_name, corr, "adj")]] <- adj
+    }
+  }
+
+  bind_rows(models)
+}
+
+# Run overall accuracy models
+cond1_accuracy <- run_accuracy_models(cond1_data, "COND1")
+cond2_accuracy <- run_accuracy_models(cond2_data, "COND2")
+all_accuracy <- bind_rows(cond1_accuracy, cond2_accuracy)
+
+# Format Table 7
+table7 <- all_accuracy %>%
+  filter(term == "arm_num") %>%
+  mutate(
+    OR = exp(estimate),
+    OR_low = exp(conf.low),
+    OR_high = exp(conf.high),
+    display = sprintf("%.2f (%.2f, %.2f)", OR, OR_low, OR_high)
+  ) %>%
+  select(
+    condition, correlation, model, display,
+    statistic, p.value, std.error, df
+  )
+
+# ============================================
+# 6. SENSITIVITY/SPECIFICITY MODELS - TABLE 8
+# ============================================
+
+run_sens_spec_models <- function(data, condition_name) {
+  results <- list()
+
+  for (corr in c("exchangeable", "independence")) {
+    # Unadjusted
+    unadj <- run_gee_kc(test ~ disease * arm_num, data, corstr = corr)
+
+    if (!is.null(unadj)) {
+      # Extract coefficients for derived metrics
+      beta2 <- unadj$estimate[unadj$term == "arm_num"]
+
+      interaction_term <- if ("disease:arm_num" %in% unadj$term) {
+        "disease:arm_num"
+      } else {
+        "arm_num:disease"
+      }
+
+      beta3 <- unadj$estimate[unadj$term == interaction_term]
+      df <- unique(unadj$df)
+
+      # Calculate sensitivity and specificity using the full covariance matrix
+      sens <- calculate_kc_contrast(
+        unadj,
+        c(
+          arm_num = 1,
+          setNames(1, interaction_term)
+        )
+      )
+
+      spec <- calculate_kc_contrast(
+        unadj,
+        c(arm_num = -1)
+      )
+
+      if (!is.null(sens) && !is.null(spec)) {
+        results[[paste(condition_name, corr, "unadj")]] <- data.frame(
+          condition = condition_name,
+          correlation = corr,
+          model = "unadjusted",
+          metric = c("sensitivity", "specificity"),
+          OR = c(exp(sens$estimate), exp(spec$estimate)),
+          OR_low = c(exp(sens$conf_low), exp(spec$conf_low)),
+          OR_high = c(exp(sens$conf_high), exp(spec$conf_high)),
+          t_stat = c(sens$t_stat, spec$t_stat),
+          p_value = c(sens$p_value, spec$p_value),
+          se = c(sens$se, spec$se),
+          df = df
+        )
+      }
+    }
+
+    # Adjusted
+    adj <- run_gee_kc(
+      test ~ disease * arm_num + wave_numeric + age_centered + male,
+      data,
+      corstr = corr
+    )
+
+    if (!is.null(adj)) {
+      interaction_term <- if ("disease:arm_num" %in% adj$term) {
+        "disease:arm_num"
+      } else {
+        "arm_num:disease"
+      }
+
+      df <- unique(adj$df)
+
+      sens <- calculate_kc_contrast(
+        adj,
+        c(
+          arm_num = 1,
+          setNames(1, interaction_term)
+        )
+      )
+
+      spec <- calculate_kc_contrast(
+        adj,
+        c(arm_num = -1)
+      )
+
+      if (!is.null(sens) && !is.null(spec)) {
+        results[[paste(condition_name, corr, "adj")]] <- data.frame(
+          condition = condition_name,
+          correlation = corr,
+          model = "adjusted",
+          metric = c("sensitivity", "specificity"),
+          OR = c(exp(sens$estimate), exp(spec$estimate)),
+          OR_low = c(exp(sens$conf_low), exp(spec$conf_low)),
+          OR_high = c(exp(sens$conf_high), exp(spec$conf_high)),
+          t_stat = c(sens$t_stat, spec$t_stat),
+          p_value = c(sens$p_value, spec$p_value),
+          se = c(sens$se, spec$se),
+          df = df
+        )
+      }
+    }
+  }
+
+  bind_rows(results)
+}
+
+# Run sensitivity/specificity models
+cond1_sens_spec <- run_sens_spec_models(cond1_data, "COND1")
+cond2_sens_spec <- run_sens_spec_models(cond2_data, "COND2")
+all_sens_spec <- bind_rows(cond1_sens_spec, cond2_sens_spec)
+
+# ============================================
+# 7. PPV/NPV MODELS - TABLE 9
+# ============================================
+
+run_ppv_npv_models <- function(data, condition_name) {
+  results <- list()
+
+  for (corr in c("exchangeable", "independence")) {
+    # Unadjusted
+    unadj <- run_gee_kc(disease ~ test * arm_num, data, corstr = corr)
+
+    if (!is.null(unadj)) {
+      interaction_term <- if ("test:arm_num" %in% unadj$term) {
+        "test:arm_num"
+      } else {
+        "arm_num:test"
+      }
+
+      df <- unique(unadj$df)
+
+      # Calculate PPV and NPV using the full covariance matrix
+      ppv <- calculate_kc_contrast(
+        unadj,
+        c(
+          arm_num = 1,
+          setNames(1, interaction_term)
+        )
+      )
+
+      npv <- calculate_kc_contrast(
+        unadj,
+        c(arm_num = -1)
+      )
+
+      if (!is.null(ppv) && !is.null(npv)) {
+        results[[paste(condition_name, corr, "unadj")]] <- data.frame(
+          condition = condition_name,
+          correlation = corr,
+          model = "unadjusted",
+          metric = c("PPV", "NPV"),
+          OR = c(exp(ppv$estimate), exp(npv$estimate)),
+          OR_low = c(exp(ppv$conf_low), exp(npv$conf_low)),
+          OR_high = c(exp(ppv$conf_high), exp(npv$conf_high)),
+          t_stat = c(ppv$t_stat, npv$t_stat),
+          p_value = c(ppv$p_value, npv$p_value),
+          se = c(ppv$se, npv$se),
+          df = df
+        )
+      }
+    }
+
+    # Adjusted
+    adj <- run_gee_kc(
+      disease ~ test * arm_num + wave_numeric + age_centered + male,
+      data,
+      corstr = corr
+    )
+
+    if (!is.null(adj)) {
+      interaction_term <- if ("test:arm_num" %in% adj$term) {
+        "test:arm_num"
+      } else {
+        "arm_num:test"
+      }
+
+      df <- unique(adj$df)
+
+      ppv <- calculate_kc_contrast(
+        adj,
+        c(
+          arm_num = 1,
+          setNames(1, interaction_term)
+        )
+      )
+
+      npv <- calculate_kc_contrast(
+        adj,
+        c(arm_num = -1)
+      )
+
+      if (!is.null(ppv) && !is.null(npv)) {
+        results[[paste(condition_name, corr, "adj")]] <- data.frame(
+          condition = condition_name,
+          correlation = corr,
+          model = "adjusted",
+          metric = c("PPV", "NPV"),
+          OR = c(exp(ppv$estimate), exp(npv$estimate)),
+          OR_low = c(exp(ppv$conf_low), exp(npv$conf_low)),
+          OR_high = c(exp(ppv$conf_high), exp(npv$conf_high)),
+          t_stat = c(ppv$t_stat, npv$t_stat),
+          p_value = c(ppv$p_value, npv$p_value),
+          se = c(ppv$se, npv$se),
+          df = df
+        )
+      }
+    }
+  }
+
+  bind_rows(results)
+}
+
+# Run PPV/NPV models
+cond1_ppv_npv <- run_ppv_npv_models(cond1_data, "COND1")
+cond2_ppv_npv <- run_ppv_npv_models(cond2_data, "COND2")
+all_ppv_npv <- bind_rows(cond1_ppv_npv, cond2_ppv_npv)
+
+# ============================================
+# 8. JOINT HYPOTHESIS TESTS - TABLE 10
+# ============================================
+
+run_joint_tests <- function(data, condition_name) {
+  results <- list()
+
+  # Helper function for a numerically stable Wald test
+  calculate_joint_wald <- function(beta, vcov, contrast) {
+    contrast_beta <- contrast %*% beta
+    contrast_vcov <- contrast %*% vcov %*% t(contrast)
+
+    if (any(!is.finite(contrast_vcov))) {
+      return(NULL)
+    }
+
+    if (qr(contrast_vcov)$rank < nrow(contrast_vcov)) {
+      return(NULL)
+    }
+
+    statistic <- as.numeric(
+      t(contrast_beta) %*% solve(contrast_vcov) %*% contrast_beta
+    )
+
+    list(
+      statistic = statistic,
+      p_value = pchisq(
+        statistic,
+        df = nrow(contrast),
+        lower.tail = FALSE
+      ),
+      df = nrow(contrast)
+    )
+  }
+
+  for (corr in c("exchangeable", "independence")) {
+    # Sensitivity/Specificity joint test
+    ss_fit <- tryCatch(
+      geeglm(
+        test ~ disease * arm_num,
+        family = binomial(link = "logit"),
+        data = data,
+        id = cluster_id,
+        corstr = corr
+      ),
+      error = function(e) {
+        message(paste("Sensitivity/specificity joint model failed:", e$message))
+        NULL
+      }
+    )
+
+    if (!is.null(ss_fit)) {
+      ss_vcov <- ss_fit$geese$vbeta
+      ss_beta <- coef(ss_fit)
+
+      # Create contrast matrix for H0: β₂ = 0 AND β₂ + β₃ = 0
+      interaction_term <- if ("disease:arm_num" %in% names(ss_beta)) {
+        "disease:arm_num"
+      } else {
+        "arm_num:disease"
+      }
+
+      K_ss <- matrix(
+        0,
+        nrow = 2,
+        ncol = length(ss_beta),
+        dimnames = list(NULL, names(ss_beta))
+      )
+
+      K_ss[1, "arm_num"] <- 1
+      K_ss[2, "arm_num"] <- 1
+      K_ss[2, interaction_term] <- 1
+
+      # Calculate Wald statistic
+      joint_ss <- calculate_joint_wald(ss_beta, ss_vcov, K_ss)
+
+      if (!is.null(joint_ss)) {
+        results[[paste(condition_name, corr, "sens_spec")]] <- data.frame(
+          condition = condition_name,
+          correlation = corr,
+          test = "Sensitivity & Specificity",
+          chisq = joint_ss$statistic,
+          df = joint_ss$df,
+          p_value = joint_ss$p_value
+        )
+      }
+    }
+
+    # PPV/NPV joint test
+    pn_fit <- tryCatch(
+      geeglm(
+        disease ~ test * arm_num,
+        family = binomial(link = "logit"),
+        data = data,
+        id = cluster_id,
+        corstr = corr
+      ),
+      error = function(e) {
+        message(paste("PPV/NPV joint model failed:", e$message))
+        NULL
+      }
+    )
+
+    if (!is.null(pn_fit)) {
+      pn_vcov <- pn_fit$geese$vbeta
+      pn_gamma <- coef(pn_fit)
+
+      # Create contrast matrix for H0: γ₂ = 0 AND γ₂ + γ₃ = 0
+      interaction_term <- if ("test:arm_num" %in% names(pn_gamma)) {
+        "test:arm_num"
+      } else {
+        "arm_num:test"
+      }
+
+      K_pn <- matrix(
+        0,
+        nrow = 2,
+        ncol = length(pn_gamma),
+        dimnames = list(NULL, names(pn_gamma))
+      )
+
+      K_pn[1, "arm_num"] <- 1
+      K_pn[2, "arm_num"] <- 1
+      K_pn[2, interaction_term] <- 1
+
+      joint_pn <- calculate_joint_wald(pn_gamma, pn_vcov, K_pn)
+
+      if (!is.null(joint_pn)) {
+        results[[paste(condition_name, corr, "ppv_npv")]] <- data.frame(
+          condition = condition_name,
+          correlation = corr,
+          test = "PPV & NPV",
+          chisq = joint_pn$statistic,
+          df = joint_pn$df,
+          p_value = joint_pn$p_value
+        )
+      }
+    }
+  }
+
+  bind_rows(results)
+}
+
+# Run joint tests
+cond1_joint <- run_joint_tests(cond1_data, "COND1")
+cond2_joint <- run_joint_tests(cond2_data, "COND2")
+all_joint <- bind_rows(cond1_joint, cond2_joint)
+
+# ============================================
+# 9. IDENTITY LINK MODELS (Overall Accuracy) - TABLE 11
+# ============================================
+
+run_identity_accuracy <- function(data, condition_name) {
+  results <- list()
+
+  for (corr in c("exchangeable", "independence")) {
+    # Unadjusted
+    unadj <- run_gee_kc(
+      accurate ~ arm_num,
+      data,
+      link = "identity",
+      corstr = corr
+    )
+
+    if (!is.null(unadj) && nrow(unadj) > 0) {
+      unadj$model <- "unadjusted"
+      unadj$correlation <- corr
+      unadj$condition <- condition_name
+      results[[paste(condition_name, corr, "unadj")]] <- unadj
+    }
+
+    # Adjusted
+    adj <- run_gee_kc(
+      accurate ~ arm_num + wave_numeric + age_centered + male,
+      data,
+      link = "identity",
+      corstr = corr
+    )
+
+    if (!is.null(adj) && nrow(adj) > 0) {
+      adj$model <- "adjusted"
+      adj$correlation <- corr
+      adj$condition <- condition_name
+      results[[paste(condition_name, corr, "adj")]] <- adj
+    }
+  }
+
+  bind_rows(results)
+}
+
+# Run identity link models
+cond1_identity_acc <- run_identity_accuracy(cond1_data, "COND1")
+cond2_identity_acc <- run_identity_accuracy(cond2_data, "COND2")
+all_identity_acc <- bind_rows(cond1_identity_acc, cond2_identity_acc)
+
+# ============================================
+# 10. FIGURE 1 & 2: LINE PLOTS FOR CLUSTER METRICS
+# ============================================
+
+create_cluster_lineplot <- function(data, condition_name, metric_name) {
+  plot_data <- data %>%
+    filter(condition == condition_name) %>%
+    group_by(arm) %>%
+    arrange(desc(.data[[metric_name]]), .by_group = TRUE) %>%
+    mutate(rank = row_number()) %>%
+    ungroup()
+
+  ggplot(
+    plot_data,
+    aes(
+      x = rank,
+      y = .data[[metric_name]],
+      color = arm,
+      group = arm
+    )
+  ) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_text(
+      aes(label = cluster_label),
+      vjust = -0.8,
+      hjust = 0.5,
+      size = 3
+    ) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      limits = c(0, 1)
+    ) +
+    labs(
+      title = paste(condition_name, "-", metric_name, "by Cluster"),
+      x = "Rank within Arm (1 = Highest)",
+      y = paste(metric_name, "(%)"),
+      color = "Trial Arm"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "top")
+}
+
+# Create plots for all metrics (excluding sensitivity)
+metrics <- c("specificity", "ppv", "npv", "accuracy")
+all_cluster_data <- bind_rows(
+  cond1_cluster,
+  cond2_cluster
+)
+
+# Generate plots (uncomment to generate)
+# for(m in metrics) {
+#   print(create_cluster_lineplot(all_cluster_data, "Condition 1", m))
+#   print(create_cluster_lineplot(all_cluster_data, "Condition 2", m))
+# }
+
+# ============================================
+# 11. SUMMARY OUTPUT - TABLES 5 & 6
+# ============================================
+
+calculate_arm_metrics <- function(data, condition_name) {
+  data %>%
+    group_by(arm_num) %>%
+    summarise(
+      condition = condition_name,
+      TP = sum(disease == 1 & test == 1, na.rm = TRUE),
+      FN = sum(disease == 1 & test == 0, na.rm = TRUE),
+      FP = sum(disease == 0 & test == 1, na.rm = TRUE),
+      TN = sum(disease == 0 & test == 0, na.rm = TRUE),
+      N = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      arm = ifelse(arm_num == 1, "Intervention", "Control"),
+      sensitivity = ifelse(TP + FN > 0, TP / (TP + FN), NA_real_),
+      specificity = ifelse(TN + FP > 0, TN / (TN + FP), NA_real_),
+      ppv = ifelse(TP + FP > 0, TP / (TP + FP), NA_real_),
+      npv = ifelse(TN + FN > 0, TN / (TN + FN), NA_real_),
+      accuracy = (TP + TN) / N
+    )
+}
+
+# Tables 5 and 6
+cond1_summary <- calculate_arm_metrics(cond1_data, "Condition 1")
+cond2_summary <- calculate_arm_metrics(cond2_data, "Condition 2")
+
+# ============================================
+# 12. APPENDIX TABLES - CLUSTER SUMMARIES
+# ============================================
+
+create_cluster_summary <- function(data, condition_name, arm_name) {
+  data %>%
+    filter(condition == condition_name, arm == arm_name) %>%
+    arrange(desc(sensitivity)) %>%
+    mutate(
+      rank = row_number(),
+      sensitivity_display = sprintf("%.1f%%", sensitivity_pct),
+      calculation = sprintf(
+        "%d / (%d + %d) = %d/%d",
+        TP, TP, FN, TP, TP + FN
+      )
+    ) %>%
+    select(
+      rank, cluster_label, N, TP, FN,
+      sensitivity_display, calculation
+    )
+}
+
+# Create cluster summaries (Tables 16-19)
+cond1_control_summary <- create_cluster_summary(
+  all_cluster_data, "Condition 1", "Control"
+)
+cond1_intervention_summary <- create_cluster_summary(
+  all_cluster_data, "Condition 1", "Intervention"
+)
+cond2_control_summary <- create_cluster_summary(
+  all_cluster_data, "Condition 2", "Control"
+)
+cond2_intervention_summary <- create_cluster_summary(
+  all_cluster_data, "Condition 2", "Intervention"
+)
